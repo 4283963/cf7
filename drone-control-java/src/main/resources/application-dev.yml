@@ -28,6 +28,10 @@ python:
   trajectory:
     service:
       url: http://localhost:5001
+      timeout-ms: 5000
+  circuit-breaker:
+    failure-threshold: 5
+    open-duration-ms: 30000
 
 deviation:
   warning:

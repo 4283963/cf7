@@ -34,19 +34,33 @@ public class TrajectoryService {
             request.getMissionName(), request.getNumDrones());
 
         Map<String, Object> pythonResult = pythonClient.computeTrajectory(request);
-        String pythonTrajectoryId = (String) pythonResult.get("trajectory_id");
-        Integer numDrones = (Integer) pythonResult.get("num_drones");
-        Integer totalTimesteps = (Integer) pythonResult.get("total_timesteps");
-        Double durationSeconds = ((Number) pythonResult.get("duration_seconds")).doubleValue();
+
+        boolean degraded = pythonResult.containsKey("degraded") &&
+            Boolean.TRUE.equals(pythonResult.get("degraded"));
+
+        String pythonTrajectoryId = safeString(pythonResult.get("trajectory_id"),
+            "FALLBACK-" + java.util.UUID.randomUUID().toString().substring(0, 8));
+        Integer numDrones = safeInt(pythonResult.get("num_drones"),
+            request.getNumDrones() != null ? request.getNumDrones() : 10);
+        Integer totalTimesteps = safeInt(pythonResult.get("total_timesteps"), 0);
+        Double durationSeconds = safeDouble(pythonResult.get("duration_seconds"), 0.0);
         Double timestepHz = pythonResult.containsKey("timestep_hz")
-            ? ((Number) pythonResult.get("timestep_hz")).doubleValue() : null;
+            ? safeDouble(pythonResult.get("timestep_hz"), 0.0) : null;
 
         Map<String, Object> collisionReport = (Map<String, Object>) pythonResult.get("collision_report");
-        Boolean hasCollisionRisk = collisionReport != null
-            && Boolean.TRUE.equals(collisionReport.get("has_risk"));
+        Boolean hasCollisionRisk = Boolean.TRUE;
+        if (collisionReport != null) {
+            Object riskFlag = collisionReport.get("has_risk");
+            if (riskFlag != null) {
+                hasCollisionRisk = Boolean.TRUE.equals(riskFlag);
+            }
+        }
+        if (degraded) {
+            hasCollisionRisk = true;
+        }
 
         String missionId = "M-" + System.currentTimeMillis() + "-" +
-            UUID.randomUUID().toString().substring(0, 6).toUpperCase();
+            java.util.UUID.randomUUID().toString().substring(0, 6).toUpperCase();
 
         TrajectoryMission mission = new TrajectoryMission();
         mission.setMissionId(missionId);
@@ -57,14 +71,40 @@ public class TrajectoryService {
         mission.setTimestepHz(timestepHz);
         mission.setPythonTrajectoryId(pythonTrajectoryId);
         mission.setHasCollisionRisk(hasCollisionRisk);
-        mission.setStatus(hasCollisionRisk ? "BLOCKED" : "READY");
+
+        if (degraded) {
+            String reason = pythonResult.get("degraded_reason") != null
+                ? pythonResult.get("degraded_reason").toString() : "Python 服务降级";
+            mission.setStatus("DEGRADED_BLOCKED");
+            mission.setFormationScript("[DEGRADED] " + reason);
+            log.warn("任务 {} 创建于降级模式: {} - 默认拦截起飞", missionId, reason);
+        } else {
+            mission.setStatus(hasCollisionRisk ? "BLOCKED" : "READY");
+        }
+
         mission = missionRepository.save(mission);
 
-        log.info("任务已创建: missionId={}, pythonTrajectoryId={}, hasRisk={}",
-            missionId, pythonTrajectoryId, hasCollisionRisk);
+        log.info("任务已创建: missionId={}, pythonTrajectoryId={}, hasRisk={}, degraded={}",
+            missionId, pythonTrajectoryId, hasCollisionRisk, degraded);
 
         missionCursor.put(missionId, 0);
         return mission;
+    }
+
+    private static Integer safeInt(Object o, Integer fallback) {
+        if (o == null) return fallback;
+        if (o instanceof Number) return ((Number) o).intValue();
+        try { return Integer.parseInt(o.toString()); } catch (Exception e) { return fallback; }
+    }
+
+    private static Double safeDouble(Object o, Double fallback) {
+        if (o == null) return fallback;
+        if (o instanceof Number) return ((Number) o).doubleValue();
+        try { return Double.parseDouble(o.toString()); } catch (Exception e) { return fallback; }
+    }
+
+    private static String safeString(Object o, String fallback) {
+        return o != null ? o.toString() : fallback;
     }
 
     @Transactional
@@ -123,27 +163,40 @@ public class TrajectoryService {
         Map<String, Object> pythonResult = pythonClient.getTrajectoryBatch(
             mission.getPythonTrajectoryId(), batchRequest);
 
+        boolean degraded = pythonResult.containsKey("degraded") &&
+            Boolean.TRUE.equals(pythonResult.get("degraded"));
+
         List<Map<String, Object>> data = (List<Map<String, Object>>) pythonResult.get("data");
         if (data == null || data.isEmpty()) {
-            throw new RuntimeException("无法从 Python 获取轨迹点");
+            if (degraded) {
+                throw new RuntimeException("Python 服务已熔断/降级，无法获取轨迹点，请稍后重试或检查 Python 服务。原因: "
+                    + safeString(pythonResult.get("degraded_reason"), "未知"));
+            }
+            throw new RuntimeException("无法从 Python 获取轨迹点，返回数据为空");
         }
 
         Map<String, Object> pointInfo = data.get(0);
-        Integer ts = ((Number) pointInfo.get("timestep")).intValue();
+        Integer ts = safeInt(pointInfo.get("timestep"), timestep);
         Double timeSeconds = pointInfo.containsKey("time_seconds")
-            ? ((Number) pointInfo.get("time_seconds")).doubleValue() : null;
-        Boolean hasRisk = (Boolean) pointInfo.get("has_collision_risk");
+            ? safeDouble(pointInfo.get("time_seconds"), timestep * 0.05) : null;
+        Boolean hasRisk = pointInfo.containsKey("has_collision_risk")
+            ? Boolean.TRUE.equals(pointInfo.get("has_collision_risk")) : Boolean.FALSE;
 
         List<List<Double>> positions = (List<List<Double>>) pointInfo.get("positions");
+        if (positions == null) {
+            positions = new ArrayList<>();
+        }
+
         List<DroneCommand> commands = new ArrayList<>();
         for (int i = 0; i < positions.size(); i++) {
             List<Double> pos = positions.get(i);
+            if (pos == null || pos.size() < 3) continue;
             DroneCommand cmd = new DroneCommand();
             cmd.setDroneIndex(i);
             cmd.setDroneCode("DRONE-" + String.format("%02d", i));
-            cmd.setTargetX(pos.get(0));
-            cmd.setTargetY(pos.get(1));
-            cmd.setTargetZ(pos.get(2));
+            cmd.setTargetX(safeDouble(pos.get(0), 0.0));
+            cmd.setTargetY(safeDouble(pos.get(1), 0.0));
+            cmd.setTargetZ(safeDouble(pos.get(2), 0.0));
             commands.add(cmd);
         }
 
@@ -152,7 +205,7 @@ public class TrajectoryService {
         batch.setTimestep(ts);
         batch.setTimeSeconds(timeSeconds);
         batch.setCommands(commands);
-        batch.setHasCollisionRisk(hasRisk);
+        batch.setHasCollisionRisk(hasRisk || degraded);
         return batch;
     }
 
@@ -183,24 +236,31 @@ public class TrajectoryService {
         Map<String, Object> pythonResult = pythonClient.getTrajectoryBatch(
             mission.getPythonTrajectoryId(), batchRequest);
 
+        boolean degraded = pythonResult.containsKey("degraded") &&
+            Boolean.TRUE.equals(pythonResult.get("degraded"));
+
         List<Map<String, Object>> data = (List<Map<String, Object>>) pythonResult.get("data");
         if (data != null) {
             for (Map<String, Object> pointInfo : data) {
-                Integer ts = ((Number) pointInfo.get("timestep")).intValue();
+                Integer ts = safeInt(pointInfo.get("timestep"), start);
                 Double timeSeconds = pointInfo.containsKey("time_seconds")
-                    ? ((Number) pointInfo.get("time_seconds")).doubleValue() : null;
-                Boolean hasRisk = (Boolean) pointInfo.getOrDefault("has_collision_risk", false);
+                    ? safeDouble(pointInfo.get("time_seconds"), ts * 0.05) : null;
+                Boolean hasRisk = pointInfo.containsKey("has_collision_risk")
+                    ? Boolean.TRUE.equals(pointInfo.get("has_collision_risk")) : Boolean.FALSE;
 
                 List<List<Double>> positions = (List<List<Double>>) pointInfo.get("positions");
+                if (positions == null) positions = new ArrayList<>();
+
                 List<DroneCommand> commands = new ArrayList<>();
                 for (int i = 0; i < positions.size(); i++) {
                     List<Double> pos = positions.get(i);
+                    if (pos == null || pos.size() < 3) continue;
                     DroneCommand cmd = new DroneCommand();
                     cmd.setDroneIndex(i);
                     cmd.setDroneCode("DRONE-" + String.format("%02d", i));
-                    cmd.setTargetX(pos.get(0));
-                    cmd.setTargetY(pos.get(1));
-                    cmd.setTargetZ(pos.get(2));
+                    cmd.setTargetX(safeDouble(pos.get(0), 0.0));
+                    cmd.setTargetY(safeDouble(pos.get(1), 0.0));
+                    cmd.setTargetZ(safeDouble(pos.get(2), 0.0));
                     commands.add(cmd);
                 }
 
@@ -209,9 +269,12 @@ public class TrajectoryService {
                 batch.setTimestep(ts);
                 batch.setTimeSeconds(timeSeconds);
                 batch.setCommands(commands);
-                batch.setHasCollisionRisk(hasRisk);
+                batch.setHasCollisionRisk(hasRisk || degraded);
                 result.add(batch);
             }
+        } else if (degraded) {
+            throw new RuntimeException("Python 服务已熔断/降级，无法批量获取指令。原因: "
+                + safeString(pythonResult.get("degraded_reason"), "未知"));
         }
         return result;
     }

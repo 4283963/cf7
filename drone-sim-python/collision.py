@@ -2,6 +2,24 @@ import numpy as np
 from typing import List, Dict, Tuple
 from formations import SAFE_DISTANCE
 
+MAX_CORRECTION_MAGNITUDE = 0.5
+OVERLAP_PERTURBATION_SCALE = 0.1
+DISTANCE_FLOOR = 1e-4
+
+
+def _safe_distance(dist: float) -> float:
+    return max(dist, DISTANCE_FLOOR)
+
+
+def _random_direction(dim: int = 3) -> np.ndarray:
+    vec = np.random.randn(dim)
+    norm = np.linalg.norm(vec)
+    if norm < 1e-12:
+        vec = np.array([1.0, 0.0, 0.0])
+    else:
+        vec = vec / norm
+    return vec
+
 
 def check_collision_pairwise(
     positions: np.ndarray,
@@ -13,9 +31,13 @@ def check_collision_pairwise(
 
     for i in range(num_drones):
         for j in range(i + 1, num_drones):
-            dist = np.linalg.norm(positions[i] - positions[j])
+            diff = positions[i] - positions[j]
+            dist = np.linalg.norm(diff)
+            if np.isnan(dist) or np.isinf(dist):
+                dist = 0.0
             if dist < safe_distance:
                 has_collision = True
+                is_overlap = dist < DISTANCE_FLOOR
                 collisions.append({
                     "drone_a": i,
                     "drone_b": j,
@@ -23,6 +45,7 @@ def check_collision_pairwise(
                     "safe_distance": safe_distance,
                     "position_a": positions[i].tolist(),
                     "position_b": positions[j].tolist(),
+                    "is_overlap": is_overlap,
                 })
     return has_collision, collisions
 
@@ -49,8 +72,14 @@ def check_trajectory_collisions(
         for i in range(num_drones):
             for j in range(i + 1, num_drones):
                 d = np.linalg.norm(positions[i] - positions[j])
+                if np.isnan(d) or np.isinf(d):
+                    d = 0.0
                 if d < min_distances[t]:
                     min_distances[t] = d
+
+    overall_min = float(np.min(min_distances))
+    if np.isnan(overall_min) or np.isinf(overall_min):
+        overall_min = 0.0
 
     summary = {
         "safe_distance": safe_distance,
@@ -59,7 +88,7 @@ def check_trajectory_collisions(
         "collision_count": len(all_collisions),
         "collision_timesteps": collision_timesteps,
         "has_risk": len(all_collisions) > 0,
-        "min_distance_overall": float(np.min(min_distances)),
+        "min_distance_overall": overall_min,
         "details": all_collisions,
     }
     return summary
@@ -79,7 +108,30 @@ def compute_correction_vectors(
                 continue
             diff = positions[i] - positions[j]
             dist = np.linalg.norm(diff)
-            if dist < safe_distance and dist > 1e-8:
-                repulsion = (safe_distance - dist) / dist * diff * repulsion_gain
-                corrections[i] += repulsion
+
+            if np.isnan(dist) or np.isinf(dist):
+                dist = 0.0
+
+            if dist >= safe_distance:
+                continue
+
+            if dist < DISTANCE_FLOOR:
+                direction = _random_direction(3)
+                magnitude = safe_distance * repulsion_gain + OVERLAP_PERTURBATION_SCALE
+                magnitude = min(magnitude, MAX_CORRECTION_MAGNITUDE)
+                corrections[i] += direction * magnitude
+            else:
+                clamped_dist = _safe_distance(dist)
+                repulsion_magnitude = (safe_distance - dist) / clamped_dist * repulsion_gain
+                repulsion_magnitude = min(repulsion_magnitude, MAX_CORRECTION_MAGNITUDE)
+                unit_diff = diff / clamped_dist
+                corrections[i] += unit_diff * repulsion_magnitude
+
+    for i in range(num_drones):
+        corr_norm = np.linalg.norm(corrections[i])
+        if corr_norm > MAX_CORRECTION_MAGNITUDE:
+            corrections[i] = corrections[i] / corr_norm * MAX_CORRECTION_MAGNITUDE
+        if not np.all(np.isfinite(corrections[i])):
+            corrections[i] = np.zeros(3)
+
     return corrections

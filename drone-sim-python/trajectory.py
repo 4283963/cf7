@@ -2,6 +2,21 @@ import numpy as np
 from scipy.interpolate import interp1d
 from typing import List, Dict, Tuple
 
+OVERLAP_JITTER = 0.02
+MIN_DURATION = 0.01
+
+
+def _deduplicate_positions(positions: np.ndarray, jitter: float = OVERLAP_JITTER) -> np.ndarray:
+    n = positions.shape[0]
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.linalg.norm(positions[i] - positions[j])
+            if dist < 1e-6:
+                perturbation = np.random.randn(3) * jitter
+                perturbation[2] = abs(perturbation[2])
+                positions[j] = positions[j] + perturbation
+    return positions
+
 
 def compute_min_jerk_trajectory(
     start: np.ndarray,
@@ -9,17 +24,11 @@ def compute_min_jerk_trajectory(
     duration: float,
     num_samples: int = 50,
 ) -> np.ndarray:
+    duration = max(duration, MIN_DURATION)
     t = np.linspace(0, duration, num_samples)
     tau = t / duration
     h = end - start
 
-    coeffs = np.array([
-        1 * tau**0,
-        0 * tau**1,
-        0 * tau**2,
-        10 * tau**3 - 15 * tau**4 + 6 * tau**5,
-        0 * tau**0,
-    ])
     pos_traj = start + np.outer(h, (10 * tau**3 - 15 * tau**4 + 6 * tau**5))
     return pos_traj.T
 
@@ -72,8 +81,10 @@ def interpolate_waypoints(
         next_formation = get_formation(form_name, num_drones)
         offset = np.array(wp_next.get("offset", [0.0, 0.0, 0.0]))
         duration = float(wp_next.get("duration", 2.0))
+        duration = max(duration, MIN_DURATION)
 
         target_positions = next_formation + offset
+        target_positions = _deduplicate_positions(target_positions)
 
         seg_times = np.linspace(0, duration, samples_per_segment + 1)
         for drone_id in range(num_drones):
@@ -116,6 +127,7 @@ def build_trajectory_from_blocks(
         action = block.get("action", "move")
         params = block.get("params", {})
         duration = params.get("duration", 2.0)
+        duration = max(float(duration), MIN_DURATION)
         prev_wp = waypoints[-1]
         curr_offset = prev_wp.get("offset", default_offset.copy()).copy()
         curr_form = prev_wp.get("formation", "square_grid")

@@ -1,5 +1,6 @@
 import uuid
 import time
+import math
 import threading
 from collections import OrderedDict
 from flask import Flask, request, jsonify
@@ -10,6 +11,33 @@ from formations import get_formation, SAFE_DISTANCE, FORMATION_SPACING
 from trajectory import build_trajectory_from_blocks, interpolate_waypoints
 from collision import check_trajectory_collisions, check_collision_pairwise, compute_correction_vectors
 from visualizer import render_trajectory_3d, render_top_view
+
+
+def _sanitize(obj):
+    if obj is None:
+        return None
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return 0.0
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(item) for item in obj]
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.floating):
+        v = float(obj)
+        if math.isnan(v) or math.isinf(v):
+            return 0.0
+        return v
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.ndarray):
+        return _sanitize(obj.tolist())
+    return obj
 
 
 app = Flask(__name__)
@@ -136,13 +164,18 @@ def compute_trajectory():
     }
     _cache_put(trajectory_id, cache_payload)
 
+    dt = float(time_array[1] - time_array[0]) if len(time_array) > 1 else 1.0
+    if dt <= 0 or math.isnan(dt) or math.isinf(dt):
+        dt = 1.0 / 30.0
+    timestep_hz = 1.0 / dt
+
     response = {
         "trajectory_id": trajectory_id,
         "num_drones": num_drones,
         "total_timesteps": int(trajectory_tensor.shape[1]),
         "time_array": time_array.tolist(),
         "duration_seconds": float(time_array[-1]) if len(time_array) > 0 else 0.0,
-        "timestep_hz": float(1.0 / (time_array[1] - time_array[0])) if len(time_array) > 1 else 30.0,
+        "timestep_hz": timestep_hz,
         "collision_report": collision_report,
     }
 
@@ -165,7 +198,7 @@ def compute_trajectory():
             ].tolist(),
         }
 
-    return jsonify(response)
+    return jsonify(_sanitize(response))
 
 
 @app.route("/api/v1/trajectory/<string:trajectory_id>/point/<int:timestep>", methods=["GET"])
@@ -203,7 +236,7 @@ def get_trajectory_point(trajectory_id: str, timestep: int):
         "corrections_applied": corrections_applied is not None,
         "correction_vectors": corrections_applied,
     }
-    return jsonify(response)
+    return jsonify(_sanitize(response))
 
 
 @app.route("/api/v1/trajectory/<string:trajectory_id>/batch", methods=["POST"])
@@ -245,12 +278,12 @@ def get_trajectory_batch(trajectory_id: str):
             "positions": positions.tolist(),
         })
 
-    return jsonify({
+    return jsonify(_sanitize({
         "trajectory_id": trajectory_id,
         "num_points": len(batch),
         "risk_count": int(sum(risk_flags)),
         "data": batch,
-    })
+    }))
 
 
 @app.route("/api/v1/collision/check", methods=["POST"])
@@ -282,7 +315,7 @@ def check_positions_collision():
         result["collision_risk_after_correction"] = has_col_after
         result["collision_details_after_correction"] = cols_after
 
-    return jsonify(result)
+    return jsonify(_sanitize(result))
 
 
 @app.route("/api/v1/deviation/check", methods=["POST"])
@@ -327,7 +360,7 @@ def check_deviation():
 
     correction_vectors = (-diff * 0.4).tolist()
 
-    return jsonify({
+    return jsonify(_sanitize({
         "max_deviation": max_dev,
         "average_deviation": avg_dev,
         "rms_deviation": rms_dev,
@@ -338,7 +371,7 @@ def check_deviation():
         "warnings": warnings,
         "emergencies": emergencies,
         "recommended_correction_vectors": correction_vectors,
-    })
+    }))
 
 
 if __name__ == "__main__":
