@@ -11,6 +11,13 @@ from formations import get_formation, SAFE_DISTANCE, FORMATION_SPACING
 from trajectory import build_trajectory_from_blocks, interpolate_waypoints
 from collision import check_trajectory_collisions, check_collision_pairwise, compute_correction_vectors
 from visualizer import render_trajectory_3d, render_top_view
+from pid_controller import (
+    FormationPIDBank,
+    compute_pid_correction,
+    apply_wind_perturbation,
+    simulate_wind_disturbance_and_correction,
+    WIND_STRENGTH_DEFAULT,
+)
 
 
 def _sanitize(obj):
@@ -47,6 +54,10 @@ trajectory_cache = OrderedDict()
 CACHE_MAX_SIZE = 100
 _cache_lock = threading.Lock()
 
+pid_bank_cache = OrderedDict()
+PID_CACHE_MAX_SIZE = 50
+_pid_lock = threading.Lock()
+
 
 def _cache_put(key: str, value: dict):
     with _cache_lock:
@@ -68,6 +79,31 @@ def _cache_get(key: str) -> dict:
 
 def _tensor_to_list(tensor: np.ndarray) -> list:
     return tensor.tolist()
+
+
+def _get_pid_bank(session_id: str, num_drones: int = 10) -> FormationPIDBank:
+    with _pid_lock:
+        if session_id in pid_bank_cache:
+            bank = pid_bank_cache[session_id]["bank"]
+            pid_bank_cache[session_id]["last_access"] = time.time()
+            return bank
+        bank = FormationPIDBank(num_drones=num_drones)
+        if len(pid_bank_cache) >= PID_CACHE_MAX_SIZE:
+            pid_bank_cache.popitem(last=False)
+        pid_bank_cache[session_id] = {"bank": bank, "last_access": time.time()}
+        return bank
+
+
+def _reset_pid_bank(session_id: str):
+    with _pid_lock:
+        if session_id in pid_bank_cache:
+            pid_bank_cache[session_id]["bank"].reset()
+            pid_bank_cache[session_id]["last_access"] = time.time()
+        else:
+            pid_bank_cache[session_id] = {
+                "bank": FormationPIDBank(num_drones=10),
+                "last_access": time.time(),
+            }
 
 
 @app.route("/api/v1/health", methods=["GET"])
@@ -360,7 +396,18 @@ def check_deviation():
 
     correction_vectors = (-diff * 0.4).tolist()
 
-    return jsonify(_sanitize({
+    pid_result = None
+    enable_pid = bool(payload.get("enable_pid", False))
+    if enable_pid:
+        wind = payload.get("wind_vector")
+        wind_vec = np.array(wind, dtype=np.float64) if wind else None
+        timestep = int(payload.get("timestep", 0))
+        dt = float(payload.get("dt", 0.05))
+        session_id = payload.get("session_id", "default")
+        bank = _get_pid_bank(session_id, num_drones=reference.shape[0])
+        pid_result = bank.compute(reference, actual, timestep, wind_vector=wind_vec, dt=dt)
+
+    result = {
         "max_deviation": max_dev,
         "average_deviation": avg_dev,
         "rms_deviation": rms_dev,
@@ -371,6 +418,200 @@ def check_deviation():
         "warnings": warnings,
         "emergencies": emergencies,
         "recommended_correction_vectors": correction_vectors,
+    }
+    if pid_result is not None:
+        result["pid_correction"] = pid_result
+
+    return jsonify(_sanitize(result))
+
+
+@app.route("/api/v1/attitude/correct", methods=["POST"])
+def attitude_pid_correction():
+    payload = request.get_json(force=True)
+    if not payload:
+        return jsonify({"error": "请求体不能为空"}), 400
+
+    if "reference_positions" not in payload or "actual_positions" not in payload:
+        return jsonify({
+            "error": "请求体必须包含 'reference_positions' 和 'actual_positions'"
+        }), 400
+
+    reference = np.array(payload["reference_positions"], dtype=np.float64)
+    actual = np.array(payload["actual_positions"], dtype=np.float64)
+    timestep = int(payload.get("timestep", 0))
+    dt = float(payload.get("dt", 0.05))
+    session_id = payload.get("session_id", "default_attitude")
+
+    wind = payload.get("wind_vector")
+    wind_vec = None
+    if wind is not None:
+        wind_vec = np.array(wind, dtype=np.float64)
+    if wind_vec is None:
+        wind_vec = WIND_STRENGTH_DEFAULT.copy()
+
+    kp = payload.get("pid_kp")
+    ki = payload.get("pid_ki")
+    kd = payload.get("pid_kd")
+    pid_kwargs = {}
+    if kp is not None:
+        pid_kwargs["kp"] = float(kp)
+    if ki is not None:
+        pid_kwargs["ki"] = float(ki)
+    if kd is not None:
+        pid_kwargs["kd"] = float(kd)
+
+    num_drones = reference.shape[0]
+    if reference.shape != actual.shape:
+        return jsonify({
+            "error": f"形状不匹配: reference {reference.shape} vs actual {actual.shape}"
+        }), 400
+
+    bank = _get_pid_bank(session_id, num_drones=num_drones)
+    if pid_kwargs:
+        for i in range(num_drones):
+            from pid_controller import MultiAxisPID
+            bank.pids[i] = MultiAxisPID(**pid_kwargs)
+
+    result = bank.compute(reference, actual, timestep, wind_vector=wind_vec, dt=dt)
+
+    if result["overall_status"] == "EMERGENCY_LAND_REQUIRED":
+        result["force_land"] = True
+        result["force_land_reason"] = "单架偏离超过应急阈值 50cm"
+        result["land_velocity_z"] = -2.0
+    else:
+        result["force_land"] = False
+
+    return jsonify(_sanitize(result))
+
+
+@app.route("/api/v1/wind/simulate", methods=["POST"])
+def simulate_wind():
+    payload = request.get_json(force=True, silent=True) or {}
+    positions = np.array(
+        payload.get("positions", [[float(i), 0.0, 2.0] for i in range(10)]),
+        dtype=np.float64,
+    )
+    timestep = int(payload.get("timestep", 0))
+    dt = float(payload.get("dt", 0.05))
+    turbulence = float(payload.get("turbulence", 0.05))
+    wind = payload.get("wind_vector")
+    wind_vec = np.array(wind, dtype=np.float64) if wind else None
+
+    displaced = apply_wind_perturbation(positions, timestep, wind_vec, dt, turbulence)
+
+    return jsonify(_sanitize({
+        "timestep": timestep,
+        "dt": dt,
+        "wind_vector": (wind_vec if wind_vec is not None else WIND_STRENGTH_DEFAULT).tolist(),
+        "turbulence": turbulence,
+        "original_positions": positions.tolist(),
+        "displaced_positions": displaced.tolist(),
+        "displacement_per_drone": (displaced - positions).tolist(),
+    }))
+
+
+@app.route("/api/v1/wind/simulate-full", methods=["POST"])
+def simulate_full_wind():
+    payload = request.get_json(force=True, silent=True) or {}
+    trajectory_id = payload.get("trajectory_id")
+
+    cached = None
+    ref_traj = None
+    if trajectory_id:
+        cached = _cache_get(trajectory_id)
+    if cached is not None:
+        ref_traj = cached["trajectory_tensor"]
+    else:
+        blocks = payload.get("blocks")
+        waypoints = payload.get("waypoints")
+        num_drones = int(payload.get("num_drones", 10))
+        samples = int(payload.get("samples_per_segment", 30))
+        if blocks:
+            ref_traj, _ = build_trajectory_from_blocks(blocks, num_drones, samples)
+        elif waypoints:
+            ref_traj, _ = interpolate_waypoints(waypoints, num_drones, samples)
+        else:
+            ref_traj = np.zeros((10, 60, 3))
+            for i in range(10):
+                for t in range(60):
+                    ref_traj[i, t] = [float(i), float(t) * 0.02, 2.0]
+
+    wind = payload.get("wind_vector")
+    wind_vec = np.array(wind, dtype=np.float64) if wind else None
+    num_steps = payload.get("num_steps")
+    dt = float(payload.get("dt", 0.05))
+    turbulence = float(payload.get("turbulence", 0.03))
+
+    result = simulate_wind_disturbance_and_correction(
+        ref_traj, wind_vector=wind_vec, num_steps=num_steps, dt=dt, turbulence=turbulence)
+    return jsonify(_sanitize(result))
+
+
+@app.route("/api/v1/pid/reset", methods=["POST"])
+def reset_pid():
+    payload = request.get_json(force=True, silent=True) or {}
+    session_id = payload.get("session_id", "default")
+    _reset_pid_bank(session_id)
+    return jsonify({
+        "status": "ok",
+        "session_id": session_id,
+        "message": "PID 积分项与微分历史已清零",
+    })
+
+
+@app.route("/api/v1/pid/status", methods=["GET"])
+def pid_status():
+    with _pid_lock:
+        sessions = list(pid_bank_cache.keys())
+    return jsonify({
+        "active_sessions": len(sessions),
+        "session_ids": sessions,
+        "cache_limit": PID_CACHE_MAX_SIZE,
+    })
+
+
+@app.route("/api/v1/emergency/land-plan", methods=["POST"])
+def emergency_land_plan():
+    payload = request.get_json(force=True, silent=True) or {}
+    num_drones = int(payload.get("num_drones", 10))
+    current_altitudes = payload.get("current_altitudes")
+    if current_altitudes is None:
+        current_altitudes = [2.0] * num_drones
+    land_velocity = float(payload.get("land_velocity_z", -2.0))
+    safe_z = float(payload.get("safe_z", 0.1))
+
+    commands = []
+    for i in range(num_drones):
+        z = float(current_altitudes[i]) if i < len(current_altitudes) else 2.0
+        steps = int(max(1, abs(z - safe_z) / abs(land_velocity) / 0.05))
+        commands.append({
+            "drone_index": i,
+            "drone_code": f"DRONE-{i:02d}",
+            "current_z": z,
+            "target_z": safe_z,
+            "velocity_z": land_velocity,
+            "velocity_x": 0.0,
+            "velocity_y": 0.0,
+            "torque_roll": 0.0,
+            "torque_pitch": 0.0,
+            "torque_yaw": 0.0,
+            "hover_before_land": True,
+            "estimated_land_steps": steps,
+            "estimated_land_seconds": steps * 0.05,
+        })
+
+    return jsonify(_sanitize({
+        "action": "FORCE_EMERGENCY_LAND",
+        "num_drones": num_drones,
+        "land_velocity_z": land_velocity,
+        "safe_z": safe_z,
+        "global_broadcast": {
+            "kill_horizontal": True,
+            "enable_landing_gear": True,
+            "led_color": "RED_BLINK",
+            "audio_alert": True,
+        },
+        "per_drone_commands": commands,
     }))
 
 

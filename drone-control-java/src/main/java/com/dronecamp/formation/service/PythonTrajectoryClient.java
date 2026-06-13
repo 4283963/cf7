@@ -341,6 +341,98 @@ public class PythonTrajectoryClient {
         }
     }
 
+    public Map<String, Object> attitudeCorrect(Map<String, Object> payload) {
+        String url = pythonServiceUrl + "/api/v1/attitude/correct";
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<Map> entity = new HttpEntity<>(payload, headers);
+
+        return executeWithFallback(
+            () -> {
+                ResponseEntity<Map> response = restTemplate.exchange(
+                    url, HttpMethod.POST, entity,
+                    new ParameterizedTypeReference<Map>() {}
+                );
+                return response.getBody();
+            },
+            (code, msg) -> {
+                Map<String, Object> fallback = new HashMap<>();
+                fallback.put("timestep", payload.getOrDefault("timestep", 0));
+                fallback.put("overall_status", "DEGRADED_PID_UNAVAILABLE");
+                fallback.put("force_land", true);
+                fallback.put("force_land_reason", "PID 服务不可用，降级为默认迫降");
+                fallback.put("land_velocity_z", -1.5);
+                fallback.put("max_deviation", 0.0);
+                fallback.put("average_deviation", 0.0);
+                fallback.put("rms_deviation", 0.0);
+                fallback.put("wind_vector_input", payload.getOrDefault("wind_vector",
+                    List.of(0.3, -0.1, 0.02)));
+                fallback.put("velocity_corrections", Collections.emptyList());
+                fallback.put("torque_corrections", Collections.emptyList());
+                fallback.put("emergency_drones", Collections.emptyList());
+                fallback.put("warning_drones", Collections.emptyList());
+                fallback.put("recommendations",
+                    List.of("[DEGRADED] Python PID 服务不可用，默认触发迫降保护。原因: " + msg));
+                fallback.put("degraded", true);
+                fallback.put("degraded_reason", msg);
+                fallback.put("error_code", code);
+                return fallback;
+            },
+            "attitudeCorrect"
+        );
+    }
+
+    public Map<String, Object> emergencyLandPlan(Map<String, Object> payload) {
+        String url = pythonServiceUrl + "/api/v1/emergency/land-plan";
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<Map> entity = new HttpEntity<>(payload, headers);
+
+        return executeWithFallback(
+            () -> {
+                ResponseEntity<Map> response = restTemplate.exchange(
+                    url, HttpMethod.POST, entity,
+                    new ParameterizedTypeReference<Map>() {}
+                );
+                return response.getBody();
+            },
+            (code, msg) -> {
+                int numDrones = payload.get("num_drones") != null
+                    ? ((Number) payload.get("num_drones")).intValue() : 10;
+                List<Map<String, Object>> perDrone = new ArrayList<>();
+                for (int i = 0; i < numDrones; i++) {
+                    Map<String, Object> cmd = new HashMap<>();
+                    cmd.put("drone_index", i);
+                    cmd.put("drone_code", "DRONE-" + String.format("%02d", i));
+                    cmd.put("velocity_z", -2.0);
+                    cmd.put("velocity_x", 0.0);
+                    cmd.put("velocity_y", 0.0);
+                    cmd.put("torque_roll", 0.0);
+                    cmd.put("torque_pitch", 0.0);
+                    cmd.put("torque_yaw", 0.0);
+                    cmd.put("target_z", 0.1);
+                    perDrone.add(cmd);
+                }
+                Map<String, Object> fb = new HashMap<>();
+                fb.put("action", "FORCE_EMERGENCY_LAND");
+                fb.put("num_drones", numDrones);
+                fb.put("land_velocity_z", -2.0);
+                fb.put("safe_z", 0.1);
+                fb.put("global_broadcast", Map.of(
+                    "kill_horizontal", true,
+                    "enable_landing_gear", true,
+                    "led_color", "RED_BLINK",
+                    "audio_alert", true
+                ));
+                fb.put("per_drone_commands", perDrone);
+                fb.put("degraded", true);
+                fb.put("degraded_reason", msg);
+                return fb;
+            },
+            "emergencyLandPlan"
+        );
+    }
+
     public Map<String, Object> getCircuitBreakerStatus() {
         Map<String, Object> status = new LinkedHashMap<>();
         status.put("circuit_open", circuitOpen.get());

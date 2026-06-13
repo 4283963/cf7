@@ -41,8 +41,118 @@ public class DeviationService {
     @Autowired
     private TrajectoryPointRepository pointRepository;
 
-    @Autowired
+        @Autowired
     private PythonTrajectoryClient pythonClient;
+
+    @Autowired
+    private AttitudeCorrectionService attitudeCorrectionService;
+
+    @Autowired
+    private EmergencyLandService emergencyLandService;
+
+    @Transactional
+    public Map<String, Object> recordBatchDeviationsWithAutoCorrection(
+            String missionId, Integer timestep, List<DronePositionReport> reports,
+            List<Double> windVector) {
+        if (emergencyLandService.isMissionBlocked(missionId)) {
+            throw new RuntimeException("任务 [" + missionId + "] 已被紧急迫降锁定，拒绝接收新坐标上报。"
+                + "请先调用 /api/v1/emergency/reset 重置。");
+        }
+
+        List<DeviationRecord> records = recordBatchDeviations(missionId, timestep, reports);
+
+        boolean anyOverWarning = false;
+        boolean anyOverEmergency = false;
+        double maxDev = 0.0;
+
+        List<List<Double>> referencePositions = new ArrayList<>();
+        List<List<Double>> actualPositions = new ArrayList<>();
+
+        TrajectoryMission mission = missionRepository.findByMissionId(missionId)
+            .orElseThrow(() -> new RuntimeException("任务不存在: " + missionId));
+        List<TrajectoryPoint> targetPoints = pointRepository
+            .findByMissionIdAndTimestep(mission.getId(), timestep);
+        Map<Integer, TrajectoryPoint> targetMap = targetPoints.stream()
+            .collect(Collectors.toMap(TrajectoryPoint::getDroneIndex, tp -> tp));
+
+        for (DronePositionReport report : reports) {
+            double dev = 0.0;
+            for (DeviationRecord r : records) {
+                if (r.getDroneIndex().equals(report.getDroneIndex())) {
+                    dev = r.getDeviationDistance();
+                    break;
+                }
+            }
+            maxDev = Math.max(maxDev, dev);
+            if (dev >= AttitudeCorrectionService.EMERGENCY_THRESHOLD_M) anyOverEmergency = true;
+            if (dev >= AttitudeCorrectionService.WARNING_THRESHOLD_M) anyOverWarning = true;
+
+            TrajectoryPoint tp = targetMap.get(report.getDroneIndex());
+            if (tp != null) {
+                referencePositions.add(Arrays.asList(tp.getTargetX(), tp.getTargetY(), tp.getTargetZ()));
+            } else {
+                referencePositions.add(Arrays.asList(0.0, 0.0, 2.0));
+            }
+            actualPositions.add(Arrays.asList(
+                report.getPosX() != null ? report.getPosX() : 0.0,
+                report.getPosY() != null ? report.getPosY() : 0.0,
+                report.getPosZ() != null ? report.getPosZ() : 0.0
+            ));
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("mission_id", missionId);
+        result.put("timestep", timestep);
+        result.put("num_drones", reports.size());
+        result.put("max_deviation", maxDev);
+        result.put("deviation_records", records);
+        result.put("warning_threshold_cm", AttitudeCorrectionService.WARNING_THRESHOLD_CM);
+        result.put("emergency_threshold_cm", AttitudeCorrectionService.EMERGENCY_THRESHOLD_CM);
+        result.put("any_over_warning", anyOverWarning);
+        result.put("any_over_emergency", anyOverEmergency);
+        result.put("frontend_red_alert", anyOverEmergency);
+
+        if (anyOverEmergency) {
+            log.error("🔴 无人机偏离超过应急阈值 (>{:.0f}cm), max={:.2f}cm，触发前端大屏爆红！",
+                AttitudeCorrectionService.EMERGENCY_THRESHOLD_CM, maxDev * 100);
+            result.put("auto_action_taken", "FRONTEND_RED_ALERT");
+            result.put("alert_message", String.format(
+                "紧急告警：%.2fcm 偏离阈值，老师可点击一键迫降！", maxDev * 100));
+        }
+
+        if (anyOverWarning) {
+            log.warn("🟡 无人机偏离超过警告阈值 (>{:.0f}cm), max={:.2f}cm，触发 PID 纠偏...",
+                AttitudeCorrectionService.WARNING_THRESHOLD_CM, maxDev * 100);
+
+            AttitudeCorrectionRequest corrReq = new AttitudeCorrectionRequest();
+            corrReq.setMissionId(missionId);
+            corrReq.setSessionId("auto-" + missionId);
+            corrReq.setTimestep(timestep);
+            corrReq.setReferencePositions(referencePositions);
+            corrReq.setActualPositions(actualPositions);
+            corrReq.setWindVector(windVector);
+            corrReq.setDt(0.05);
+            corrReq.setPersist(true);
+
+            AttitudeCorrectionResult corrResult =
+                attitudeCorrectionService.computeAndStoreCorrection(corrReq);
+            result.put("pid_correction_triggered", true);
+            result.put("pid_correction", corrResult);
+
+            if (Boolean.TRUE.equals(corrResult.getForceLand())) {
+                result.put("auto_action_taken", "AUTO_EMERGENCY_LAND");
+                result.put("force_land_triggered", true);
+                result.put("force_land_reason", corrResult.getForceLandReason());
+            } else {
+                result.put("auto_action_taken", "PID_AUTO_CORRECTION");
+            }
+        } else {
+            result.put("pid_correction_triggered", false);
+            result.put("auto_action_taken", "NONE");
+        }
+
+        return result;
+    }
 
     @Transactional
     public List<DeviationRecord> recordBatchDeviations(String missionId, Integer timestep,

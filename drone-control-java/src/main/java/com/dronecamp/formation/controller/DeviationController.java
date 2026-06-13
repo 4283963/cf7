@@ -35,6 +35,30 @@ public class DeviationController {
         }
     }
 
+    @PostMapping("/report-with-correction")
+    public ApiResponse<Map<String, Object>> reportWithAutoCorrection(@RequestBody BatchPositionReport report) {
+        try {
+            List<Double> windVector = report.getWindVector();
+            Map<String, Object> result = deviationService.recordBatchDeviationsWithAutoCorrection(
+                report.getMissionId(),
+                report.getTimestep(),
+                report.getPositions(),
+                windVector
+            );
+            Boolean redAlert = (Boolean) result.get("frontend_red_alert");
+            String action = (String) result.get("auto_action_taken");
+            if (Boolean.TRUE.equals(redAlert)) {
+                log.error("🔴 前端爆红告警触发! missionId={}, action={}", report.getMissionId(), action);
+            } else if (!"NONE".equals(action)) {
+                log.warn("🟡 PID 自动纠偏触发: missionId={}, action={}", report.getMissionId(), action);
+            }
+            return ApiResponse.ok(result);
+        } catch (Exception e) {
+            log.error("带纠偏的上报失败: {}", e.getMessage(), e);
+            return ApiResponse.error("上报失败: " + e.getMessage());
+        }
+    }
+
     @PostMapping("/report/single")
     public ApiResponse<DeviationRecord> reportSinglePosition(@RequestBody DronePositionReport report) {
         try {

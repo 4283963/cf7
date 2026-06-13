@@ -8,4 +8,5 @@ public class BatchPositionReport {
     private String missionId;
     private Integer timestep;
     private List<DronePositionReport> positions;
+    private List<Double> windVector;
 }
